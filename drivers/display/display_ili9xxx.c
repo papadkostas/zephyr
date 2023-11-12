@@ -392,6 +392,21 @@ static int ili9xxx_init(const struct device *dev)
 		}
 	}
 
+	if (config->backlight.port != NULL) {
+		LOG_DBG("Backlight on!");
+		if (!device_is_ready(config->backlight.port)) {
+			LOG_ERR("Backlight GPIO device not ready");
+			return -ENODEV;
+		}
+
+		r = gpio_pin_configure_dt(&config->backlight, GPIO_OUTPUT_ACTIVE);
+		if (r < 0) {
+			LOG_ERR("Could not configure backlight GPIO (%d)", r);
+			return r;
+		}
+		LOG_DBG("Backlight on!");
+	}
+
 	ili9xxx_hw_reset(dev);
 
 	r = ili9xxx_transmit(dev, ILI9XXX_SWRESET, NULL, 0);
@@ -470,6 +485,8 @@ static const struct ili9xxx_quirks ili9488_quirks = {
 					     cmd_data_gpios),                  \
 		.reset = GPIO_DT_SPEC_GET_OR(INST_DT_ILI9XXX(n, t),            \
 					     reset_gpios, {0}),                \
+		.backlight = GPIO_DT_SPEC_GET_OR(INST_DT_ILI9XXX(n, t),            \
+					     backlight_gpios, {0}),                \
 		.pixel_format = DT_PROP(INST_DT_ILI9XXX(n, t), pixel_format),  \
 		.rotation = DT_PROP(INST_DT_ILI9XXX(n, t), rotation),          \
 		.x_resolution = ILI##t##_X_RES,                                \
