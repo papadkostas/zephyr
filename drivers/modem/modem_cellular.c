@@ -77,6 +77,8 @@ static const char *modem_cellular_state_str(enum modem_cellular_state state)
 		return "set baudrate";
 	case MODEM_CELLULAR_STATE_RUN_INIT_SCRIPT:
 		return "run init script";
+	case MODEM_CELLULAR_STATE_RUN_GNSS_POWER_ON_SCRIPT:
+		return "run gnss power on script";
 	case MODEM_CELLULAR_STATE_RUN_CONFIGURATION_SCRIPT:
 		return "run configuration script";
 	case MODEM_CELLULAR_STATE_CONNECT_CMUX:
@@ -101,6 +103,8 @@ static const char *modem_cellular_state_str(enum modem_cellular_state state)
 		return "registered";
 	case MODEM_CELLULAR_STATE_AWAIT_PPP_DEAD:
 		return "await PPP dead";
+	case MODEM_CELLULAR_STATE_RUN_GNSS_SHUTDOWN_SCRIPT:
+		return "run gnss shutdown script";
 	case MODEM_CELLULAR_STATE_INIT_POWER_OFF:
 		return "init power off";
 	case MODEM_CELLULAR_STATE_RUN_SHUTDOWN_SCRIPT:
@@ -174,6 +178,7 @@ static bool modem_cellular_apn_change_allowed(enum modem_cellular_state st)
 	case MODEM_CELLULAR_STATE_AWAIT_POWER_ON:
 	case MODEM_CELLULAR_STATE_SET_BAUDRATE:
 	case MODEM_CELLULAR_STATE_RUN_INIT_SCRIPT:
+	case MODEM_CELLULAR_STATE_RUN_GNSS_POWER_ON_SCRIPT:
 	case MODEM_CELLULAR_STATE_RUN_CONFIGURATION_SCRIPT:
 	case MODEM_CELLULAR_STATE_CONNECT_CMUX:
 	case MODEM_CELLULAR_STATE_OPEN_DLCI1:
@@ -843,6 +848,18 @@ static void modem_cellular_begin_power_off_pulse(struct modem_cellular_data *dat
 	}
 }
 
+static void modem_cellular_enter_power_off_state(struct modem_cellular_data *data)
+{
+	const struct modem_cellular_config *config = data->dev->config;
+
+	if (data->cmd_pipe != NULL && config->vendor->scripts.gnss_shutdown != NULL) {
+		modem_chat_release(&data->chat);
+		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_RUN_GNSS_SHUTDOWN_SCRIPT);
+	} else {
+		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+	}
+}
+
 static int modem_cellular_on_idle_state_enter(struct modem_cellular_data *data)
 {
 	const struct modem_cellular_config *config = data->dev->config;
@@ -1283,6 +1300,40 @@ static void modem_cellular_close_bus_pipe(struct modem_cellular_data *data)
 	modem_pipe_close_async(data->uart_pipe);
 }
 
+static int modem_cellular_on_run_gnss_power_on_script_state_enter(struct modem_cellular_data *data)
+{
+	const struct modem_cellular_config *config = data->dev->config;
+
+	modem_chat_run_script_async(&data->chat, config->vendor->scripts.gnss_power_on);
+	return 0;
+}
+
+static void modem_cellular_run_gnss_power_on_script_event_handler(struct modem_cellular_data *data,
+								  enum modem_cellular_event evt)
+{
+	switch (evt) {
+	case MODEM_CELLULAR_EVENT_SCRIPT_FAILED:
+		/* The GNSS receiver is optional hardware: a failure here must never
+		 * abort cellular initialization.
+		 */
+		LOG_WRN("GNSS init script failed, continuing without GNSS");
+		__fallthrough;
+	case MODEM_CELLULAR_EVENT_SCRIPT_SUCCESS:
+		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_RUN_CONFIGURATION_SCRIPT);
+		break;
+
+	case MODEM_CELLULAR_EVENT_BUS_CLOSED:
+		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_CONNECT_CMUX);
+		break;
+
+	case MODEM_CELLULAR_EVENT_SUSPEND:
+		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_IDLE);
+		break;
+
+	default:
+		break;
+	}
+}
 
 static int modem_cellular_on_run_configuration_script_state_enter(struct modem_cellular_data *data)
 {
@@ -1329,7 +1380,13 @@ static void modem_cellular_run_init_script_event_handler(struct modem_cellular_d
 		break;
 
 	case MODEM_CELLULAR_EVENT_SCRIPT_SUCCESS:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_RUN_CONFIGURATION_SCRIPT);
+		if (config->vendor->scripts.gnss_power_on != NULL) {
+			modem_cellular_enter_state(data,
+						    MODEM_CELLULAR_STATE_RUN_GNSS_POWER_ON_SCRIPT);
+		} else {
+			modem_cellular_enter_state(data,
+						    MODEM_CELLULAR_STATE_RUN_CONFIGURATION_SCRIPT);
+		}
 		break;
 
 	case MODEM_CELLULAR_EVENT_BUS_CLOSED:
@@ -1397,7 +1454,7 @@ static void modem_cellular_connect_cmux_event_handler(struct modem_cellular_data
 		break;
 
 	case MODEM_CELLULAR_EVENT_SUSPEND:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 
 	default:
@@ -1429,7 +1486,7 @@ static void modem_cellular_open_dlci1_event_handler(struct modem_cellular_data *
 
 	case MODEM_CELLULAR_EVENT_SUSPEND:
 		modem_chat_release(&data->chat);
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 
 	case MODEM_CELLULAR_EVENT_SCRIPT_SUCCESS:
@@ -1509,7 +1566,7 @@ static void modem_cellular_open_dlci2_event_handler(struct modem_cellular_data *
 
 	case MODEM_CELLULAR_EVENT_SUSPEND:
 		modem_chat_release(&data->chat);
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 
 	case MODEM_CELLULAR_EVENT_SCRIPT_SUCCESS:
@@ -1539,7 +1596,7 @@ static void modem_cellular_wait_for_apn_event_handler(struct modem_cellular_data
 		break;
 
 	case MODEM_CELLULAR_EVENT_SUSPEND:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 
 	default:
@@ -1603,7 +1660,7 @@ static void modem_cellular_run_board_init_script_event_handler(struct modem_cell
 		}
 		break;
 	case MODEM_CELLULAR_EVENT_SUSPEND:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 	default:
 		break;
@@ -1639,7 +1696,7 @@ static void modem_cellular_run_apn_script_event_handler(struct modem_cellular_da
 		}
 		break;
 	case MODEM_CELLULAR_EVENT_SUSPEND:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 	case MODEM_CELLULAR_EVENT_RING:
 		modem_pipe_open_async(data->uart_pipe);
@@ -1679,7 +1736,7 @@ static void modem_cellular_run_network_script_event_handler(struct modem_cellula
 		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_AWAIT_REGISTERED);
 		break;
 	case MODEM_CELLULAR_EVENT_SUSPEND:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 	case MODEM_CELLULAR_EVENT_RING:
 		modem_pipe_open_async(data->uart_pipe);
@@ -1761,7 +1818,7 @@ static void modem_cellular_await_dial_event_handler(struct modem_cellular_data *
 		break;
 
 	case MODEM_CELLULAR_EVENT_SUSPEND:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 	case MODEM_CELLULAR_EVENT_RING:
 		modem_pipe_open_async(data->uart_pipe);
@@ -1823,7 +1880,7 @@ static void modem_cellular_run_dial_script_event_handler(struct modem_cellular_d
 		break;
 
 	case MODEM_CELLULAR_EVENT_SUSPEND:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 	case MODEM_CELLULAR_EVENT_RING:
 		LOG_DBG("RING received!");
@@ -1921,7 +1978,7 @@ static void modem_cellular_await_registered_event_handler(struct modem_cellular_
 		modem_cellular_start_timer(data, MODEM_CELLULAR_PERIODIC_SCRIPT_TIMEOUT);
 		break;
 	case MODEM_CELLULAR_EVENT_SUSPEND:
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 	case MODEM_CELLULAR_EVENT_RING:
 		LOG_DBG("RING received!");
@@ -2024,8 +2081,7 @@ static void modem_cellular_registered_event_handler(struct modem_cellular_data *
 		break;
 	case MODEM_CELLULAR_EVENT_SUSPEND:
 		modem_chat_release(&data->chat);
-		modem_ppp_release(config->ppp);
-		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		modem_cellular_enter_power_off_state(data);
 		break;
 	case MODEM_CELLULAR_EVENT_RING:
 		LOG_DBG("RING received!");
@@ -2161,6 +2217,39 @@ static void modem_cellular_init_power_off_event_handler(struct modem_cellular_da
 	}
 }
 
+static int modem_cellular_on_run_gnss_shutdown_script_state_enter(struct modem_cellular_data *data)
+{
+	const struct modem_cellular_config *config = data->dev->config;
+
+	modem_chat_attach(&data->chat, data->cmd_pipe);
+	return modem_chat_run_script_async(&data->chat, config->vendor->scripts.gnss_shutdown);
+}
+
+static void modem_cellular_run_gnss_shutdown_script_event_handler(struct modem_cellular_data *data,
+								  enum modem_cellular_event evt)
+{
+	switch (evt) {
+	case MODEM_CELLULAR_EVENT_SCRIPT_FAILED:
+		/* The GNSS receiver is optional hardware: a failure here must never
+		 * block modem power-off.
+		 */
+		LOG_WRN("GNSS shutdown script failed, continuing with modem power-off");
+		__fallthrough;
+	case MODEM_CELLULAR_EVENT_SCRIPT_SUCCESS:
+		modem_cellular_enter_state(data, MODEM_CELLULAR_STATE_INIT_POWER_OFF);
+		break;
+
+	default:
+		break;
+	}
+}
+
+static int modem_cellular_on_run_gnss_shutdown_script_state_leave(struct modem_cellular_data *data)
+{
+	modem_chat_release(&data->chat);
+	return 0;
+}
+
 static int modem_cellular_on_run_shutdown_script_state_enter(struct modem_cellular_data *data)
 {
 	const struct modem_cellular_config *config = data->dev->config;
@@ -2288,6 +2377,10 @@ static int modem_cellular_on_state_enter(struct modem_cellular_data *data)
 		ret = modem_cellular_on_run_init_script_state_enter(data);
 		break;
 
+	case MODEM_CELLULAR_STATE_RUN_GNSS_POWER_ON_SCRIPT:
+		ret = modem_cellular_on_run_gnss_power_on_script_state_enter(data);
+		break;
+
 	case MODEM_CELLULAR_STATE_RUN_CONFIGURATION_SCRIPT:
 		ret = modem_cellular_on_run_configuration_script_state_enter(data);
 		break;
@@ -2334,6 +2427,10 @@ static int modem_cellular_on_state_enter(struct modem_cellular_data *data)
 
 	case MODEM_CELLULAR_STATE_AWAIT_PPP_DEAD:
 		ret = modem_cellular_on_await_ppp_dead_state_enter(data);
+		break;
+
+	case MODEM_CELLULAR_STATE_RUN_GNSS_SHUTDOWN_SCRIPT:
+		ret = modem_cellular_on_run_gnss_shutdown_script_state_enter(data);
 		break;
 
 	case MODEM_CELLULAR_STATE_INIT_POWER_OFF:
@@ -2411,6 +2508,10 @@ static int modem_cellular_on_state_leave(struct modem_cellular_data *data)
 
 	case MODEM_CELLULAR_STATE_AWAIT_PPP_DEAD:
 		ret = modem_cellular_on_await_ppp_dead_state_leave(data);
+		break;
+
+	case MODEM_CELLULAR_STATE_RUN_GNSS_SHUTDOWN_SCRIPT:
+		ret = modem_cellular_on_run_gnss_shutdown_script_state_leave(data);
 		break;
 
 	case MODEM_CELLULAR_STATE_RUN_SHUTDOWN_SCRIPT:
@@ -2492,6 +2593,10 @@ static void modem_cellular_event_handler(struct modem_cellular_data *data,
 		modem_cellular_run_init_script_event_handler(data, evt);
 		break;
 
+	case MODEM_CELLULAR_STATE_RUN_GNSS_POWER_ON_SCRIPT:
+		modem_cellular_run_gnss_power_on_script_event_handler(data, evt);
+		break;
+
 	case MODEM_CELLULAR_STATE_RUN_CONFIGURATION_SCRIPT:
 		modem_cellular_run_configuration_script_event_handler(data, evt);
 		break;
@@ -2542,6 +2647,10 @@ static void modem_cellular_event_handler(struct modem_cellular_data *data,
 
 	case MODEM_CELLULAR_STATE_AWAIT_PPP_DEAD:
 		modem_cellular_await_ppp_dead_event_handler(data, evt);
+		break;
+
+	case MODEM_CELLULAR_STATE_RUN_GNSS_SHUTDOWN_SCRIPT:
+		modem_cellular_run_gnss_shutdown_script_event_handler(data, evt);
 		break;
 
 	case MODEM_CELLULAR_STATE_INIT_POWER_OFF:
